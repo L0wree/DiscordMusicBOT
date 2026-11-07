@@ -1,0 +1,10 @@
+discord.py>=2.4.0
+yt-dlp>=2026.10.0
+python-dotenv>=1.0.0
+pystray>=0.19.0
+Pillow>=10.0.0
+PyNaCl>=1.5.0
+winrt-Windows.Media.Control; sys_platform == "win32"
+winrt-Windows.Foundation; sys_platform == "win32"
+winrt-Windows.Foundation.Collections; sys_platform == "win32"
+

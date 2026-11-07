@@ -1,0 +1,21 @@
+# Secrets & Environment
+.env
+.env.*
+!.env.example
+
+# Logs & Runtime State
+*.log
+bot.log
+.antigravity_update.json
+
+# Python Cache & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+build/
+dist/
+*.spec
+
