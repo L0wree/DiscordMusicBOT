@@ -6,6 +6,8 @@ import sys
 import subprocess
 import json
 import time
+import re
+import ctypes
 from datetime import datetime, timezone
 import discord.player
 
@@ -18,13 +20,25 @@ try:
 except ImportError:
     HAS_WINRT = False
 
-# Patch FFmpegOpusAudio._probe_codec_native on Windows to prevent CMD window popups during ffprobe
+# Lower process priority on Windows so background yt-dlp/ffmpeg work never causes frame/lag spikes in games
 if sys.platform == 'win32':
+    CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+    BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+    SUBPROCESS_FLAGS = CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS
+
+    try:
+        ctypes.windll.kernel32.SetPriorityClass(
+            ctypes.windll.kernel32.GetCurrentProcess(),
+            BELOW_NORMAL_PRIORITY_CLASS,
+        )
+    except Exception:
+        pass
+
     @staticmethod
     def _fixed_probe_codec_native(source, executable: str = 'ffmpeg'):
         exe = executable[:2] + 'probe' if executable in ('ffmpeg', 'avconv') else executable
         args = [exe, '-v', 'quiet', '-print_format', 'json', '-show_streams', '-select_streams', 'a:0', source]
-        kwargs = {'creationflags': getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)}
+        kwargs = {'creationflags': SUBPROCESS_FLAGS}
         output = subprocess.check_output(args, timeout=20, **kwargs)
         codec = bitrate = None
 
@@ -39,6 +53,21 @@ if sys.platform == 'win32':
         return codec, bitrate
 
     discord.player.FFmpegOpusAudio._probe_codec_native = _fixed_probe_codec_native
+
+    # Also patch FFmpegAudio._spawn_process so ffmpeg.exe runs at BELOW_NORMAL_PRIORITY_CLASS
+    def _low_priority_spawn_process(self, args, **subprocess_kwargs):
+        process = None
+        try:
+            process = subprocess.Popen(args, creationflags=SUBPROCESS_FLAGS, **subprocess_kwargs)
+        except FileNotFoundError:
+            executable = args.partition(' ')[0] if isinstance(args, str) else args[0]
+            raise discord.ClientException(executable + ' was not found.') from None
+        except subprocess.SubprocessError as exc:
+            raise discord.ClientException(f'Popen failed: {exc.__class__.__name__}: {exc}') from exc
+        else:
+            return process
+
+    discord.player.FFmpegAudio._spawn_process = _low_priority_spawn_process
 
 
 def format_time(seconds: float) -> str:
@@ -69,9 +98,27 @@ class MusicCog(commands.Cog):
         }
         self.ffmpeg_options = {
             'options': '-vn',
-            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -readrate 1.5 -readrate_initial_burst 5'
         }
         self.vc = None
+
+        # Persistent YoutubeDL instances so YouTube player JS cache is kept in memory across track switches
+        self._ydl_flat = yt_dlp.YoutubeDL({
+            'extract_flat': True,
+            'quiet': True,
+            'no_warnings': True,
+            'nocheckcertificate': True,
+            'source_address': '0.0.0.0',
+        })
+        self._ydl_stream = yt_dlp.YoutubeDL({
+            'format': 'bestaudio/best',
+            'noplaylist': True,
+            'nocheckcertificate': True,
+            'quiet': True,
+            'no_warnings': True,
+            'source_address': '0.0.0.0',
+        })
+        self._ydl_lock = False
 
         # Follow-me state
         self.following = False
@@ -85,6 +132,7 @@ class MusicCog(commands.Cog):
         self.follow_pause_pos = 0.0
         self._suppress_after = False
         self._stream_cache = {}
+        self._failed_tracks = {}
 
     async def _get_local_media_state(self):
         """Reads Windows GSMTC media sessions (prioritizing Brave / active browser)."""
@@ -152,9 +200,15 @@ class MusicCog(commands.Cog):
         now = datetime.now(timezone.utc)
         if is_playing and last_updated and last_updated.year > 1970:
             elapsed = max(0.0, (now - last_updated).total_seconds())
-            position = raw_pos + elapsed * rate
-            if duration > 0:
-                position = min(position, duration)
+            # Guard against stale last_updated_time when browser transitions between tracks
+            if duration > 0 and (raw_pos + elapsed * rate) > duration + 5.0:
+                position = min(raw_pos, duration)
+            elif duration <= 0 and elapsed > 300.0:
+                position = raw_pos
+            else:
+                position = raw_pos + elapsed * rate
+                if duration > 0:
+                    position = min(position, duration)
         else:
             position = raw_pos
 
@@ -170,7 +224,7 @@ class MusicCog(commands.Cog):
         }
 
     def _resolve_track_sync(self, title: str, artist: str, target_duration: float):
-        """Resolves a track title/artist into a direct audio stream URL, matching duration if available."""
+        """Resolves a track title/artist into a direct audio stream URL, reusing persistent YoutubeDL instances."""
         cache_key = (title.lower(), artist.lower(), int(round(target_duration / 3.0)) if target_duration > 0 else 0)
         cached = self._stream_cache.get(cache_key)
         if cached and (time.time() - cached["fetched_at"] < 3600):
@@ -181,56 +235,49 @@ class MusicCog(commands.Cog):
         else:
             search_query = title
 
-        flat_opts = {
-            'extract_flat': True,
-            'quiet': True,
-            'no_warnings': True,
-            'nocheckcertificate': True,
-            'source_address': '0.0.0.0',
-        }
+        # Clean trademark / special symbols that can break YouTube search queries
+        clean_query = re.sub(r'[™®©]+', '', search_query).strip()
 
         chosen_id = None
-        with yt_dlp.YoutubeDL(flat_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch5:{search_query}", download=False)
-            entries = [e for e in (info.get('entries') or []) if e and e.get('id')]
-            if entries:
-                if target_duration > 0:
-                    def score_entry(idx_entry):
-                        idx, e = idx_entry
-                        dur = e.get('duration')
-                        if dur is None:
-                            return 1000 + idx * 5
-                        diff = abs(float(dur) - target_duration)
-                        # Heavily favor exact duration match (within 2.5s), while respecting search rank
-                        if diff <= 2.5:
-                            return diff + idx * 0.5
-                        return diff + idx * 3.0
+        for q in (clean_query, title):
+            if not q:
+                continue
+            try:
+                info = self._ydl_flat.extract_info(f"ytsearch5:{q}", download=False)
+                entries = [e for e in (info.get('entries') or []) if e and e.get('id')]
+                if entries:
+                    if target_duration > 0:
+                        def score_entry(idx_entry):
+                            idx, e = idx_entry
+                            dur = e.get('duration')
+                            if dur is None:
+                                return 1000 + idx * 5
+                            diff = abs(float(dur) - target_duration)
+                            if diff <= 2.5:
+                                return diff + idx * 0.5
+                            return diff + idx * 3.0
 
-                    best_idx, best_entry = min(enumerate(entries), key=score_entry)
-                    chosen_id = best_entry['id']
-                else:
-                    chosen_id = entries[0]['id']
+                        _, best_entry = min(enumerate(entries), key=score_entry)
+                        chosen_id = best_entry['id']
+                    else:
+                        chosen_id = entries[0]['id']
+                    break
+            except Exception as e:
+                print(f"[FollowMe] Flat search warning for '{q}': {e}")
 
-        stream_opts = {
-            'format': 'bestaudio/best',
-            'noplaylist': True,
-            'nocheckcertificate': True,
-            'quiet': True,
-            'no_warnings': True,
-            'source_address': '0.0.0.0',
-        }
-
-        target_url = f"https://www.youtube.com/watch?v={chosen_id}" if chosen_id else f"ytsearch1:{search_query}"
-        with yt_dlp.YoutubeDL(stream_opts) as ydl:
-            data = ydl.extract_info(target_url, download=False)
-            if 'entries' in data:
-                data = data['entries'][0]
+        target_url = f"https://www.youtube.com/watch?v={chosen_id}" if chosen_id else f"ytsearch1:{clean_query}"
+        data = self._ydl_stream.extract_info(target_url, download=False)
+        if 'entries' in data:
+            entries = [e for e in (data.get('entries') or []) if e]
+            if not entries:
+                raise ValueError(f"No search results found for '{clean_query}'")
+            data = entries[0]
 
         result = {
             'url': data['url'],
             'title': data.get('title', search_query),
             'webpage_url': data.get('webpage_url', target_url),
-            'duration': data.get('duration') or target_duration,
+            'duration': float(data.get('duration') or target_duration or 0.0),
             'acodec': data.get('acodec'),
             'abr': data.get('abr'),
             'fetched_at': time.time(),
@@ -251,17 +298,24 @@ class MusicCog(commands.Cog):
                     break
                 await asyncio.sleep(0.05)
 
-        before_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-        if start_pos >= 0.5:
+        # Rate-limit FFmpeg HTTP stream reading (-readrate 1.5 -readrate_initial_burst 5)
+        # so starting a track never causes a 100+ Mbps download burst / bufferbloat spike in games.
+        # Only pass -ss if we are actually mid-song (>= 2.5s), avoiding an extra HTTP Range roundtrip at 0:00.
+        before_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -readrate 1.5 -readrate_initial_burst 5"
+        if start_pos >= 2.5:
             before_opts += f" -ss {start_pos:.2f}"
+        else:
+            start_pos = 0.0
 
         acodec = stream_info.get('acodec')
         if acodec in ('opus', 'libopus'):
-            source = discord.FFmpegOpusAudio(
-                stream_info['url'],
-                codec='copy',
-                before_options=before_opts,
-                options='-vn',
+            source = await asyncio.to_thread(
+                lambda: discord.FFmpegOpusAudio(
+                    stream_info['url'],
+                    codec='copy',
+                    before_options=before_opts,
+                    options='-vn',
+                )
             )
         else:
             source = await discord.FFmpegOpusAudio.from_probe(
@@ -310,34 +364,52 @@ class MusicCog(commands.Cog):
 
                 # 1. Check if song changed
                 if track_key != self.follow_track_key:
-                    self.follow_track_key = track_key
+                    # Skip retrying immediately if this track just failed resolution
+                    fail_time = self._failed_tracks.get(track_key, 0.0)
+                    if time.monotonic() - fail_time < 10.0:
+                        await asyncio.sleep(1.5)
+                        continue
+
                     display_name = f"{state['artist']} - {state['title']}" if state['artist'] else state['title']
                     print(f"[FollowMe] Detected new track: {display_name} (dur: {state['duration']:.1f}s)")
 
                     t0 = time.monotonic()
-                    stream_info = await asyncio.to_thread(
-                        self._resolve_track_sync,
-                        state["title"],
-                        state["artist"],
-                        state["duration"],
-                    )
-                    # Re-fetch fresh position after yt-dlp resolution so we account for lookup time!
+                    try:
+                        stream_info = await asyncio.to_thread(
+                            self._resolve_track_sync,
+                            state["title"],
+                            state["artist"],
+                            state["duration"],
+                        )
+                    except Exception as e:
+                        print(f"[FollowMe] Failed to resolve '{display_name}': {e}")
+                        self._failed_tracks[track_key] = time.monotonic()
+                        await asyncio.sleep(2.0)
+                        continue
+
+                    # Re-fetch fresh position after yt-dlp resolution so we account for lookup time
+                    # and let Brave finish resetting its timeline from the previous track
                     fresh_state = await self._get_local_media_state()
                     if fresh_state and (fresh_state["title"].lower(), fresh_state["artist"].lower()) == track_key:
                         state = fresh_state
                     else:
-                        # Fallback if state disappeared mid-lookup
                         if state["is_playing"]:
                             state["position"] += (time.monotonic() - t0)
 
-                    # Add ~0.6s compensation for FFmpeg HTTP stream startup when actively playing
-                    target_pos = state["position"] + (0.6 if state["is_playing"] else 0.0)
-                    if stream_info.get("duration") and target_pos >= stream_info["duration"] - 1.0:
-                        target_pos = max(0.0, state["position"])
+                    stream_dur = float(stream_info.get("duration") or state["duration"] or 0.0)
+                    # If Brave still reports a stale end-of-previous-song position right after track switch, reset to 0
+                    if stream_dur > 0 and state["position"] >= stream_dur - 3.0:
+                        target_pos = 0.0
+                    elif state["position"] < 2.5:
+                        target_pos = 0.0
+                    else:
+                        target_pos = state["position"] + (0.4 if state["is_playing"] else 0.0)
 
+                    self.follow_track_key = track_key
                     self.follow_stream_info = stream_info
                     await self._start_follow_playback(stream_info, target_pos, paused=not state["is_playing"])
-                    await asyncio.sleep(1.0)
+                    # Give a 2-second grace window after starting a new track so transitional GSMTC updates settle
+                    await asyncio.sleep(2.0)
                     continue
 
                 # 2. Same song: check play/pause state changes
@@ -350,8 +422,8 @@ class MusicCog(commands.Cog):
 
                 elif state["is_playing"] and self.follow_paused:
                     drift = abs(state["position"] - self.follow_pause_pos)
-                    if drift > 2.5 and self.follow_stream_info:
-                        target_pos = state["position"] + 0.6
+                    if drift > 3.0 and self.follow_stream_info:
+                        target_pos = state["position"] + 0.4
                         await self._start_follow_playback(self.follow_stream_info, target_pos, paused=False)
                         print(f"[FollowMe] Resumed with seek to {format_time(state['position'])}")
                     else:
@@ -367,19 +439,25 @@ class MusicCog(commands.Cog):
                     bot_pos = self._get_bot_estimated_pos()
                     drift = abs(state["position"] - bot_pos)
 
-                    # Seek if drift > 3.5 seconds, or if bot stopped early while browser is still playing
+                    stream_dur = float(self.follow_stream_info.get("duration") or state["duration"] or 0.0)
+                    effective_dur = min(d for d in (stream_dur, state["duration"]) if d > 0) if (stream_dur > 0 or state["duration"] > 0) else 0.0
+
+                    # Only consider bot stopped early if current position is well before the end of the stream
                     bot_stopped_early = (
                         not self.vc.is_playing()
                         and not self.vc.is_paused()
-                        and state["duration"] > 0
-                        and state["position"] < state["duration"] - 3.0
+                        and effective_dur > 0
+                        and state["position"] < effective_dur - 5.0
                     )
 
-                    if drift > 3.5 or bot_stopped_early:
-                        target_pos = state["position"] + 0.6
+                    # Do not seek past the end of the resolved audio stream
+                    can_seek_to_pos = (effective_dur <= 0) or (state["position"] < effective_dur - 3.0)
+
+                    if (drift > 4.0 or bot_stopped_early) and can_seek_to_pos:
+                        target_pos = state["position"] + 0.4
                         print(f"[FollowMe] Seek detected (Browser: {state['position']:.1f}s vs Bot: {bot_pos:.1f}s). Syncing...")
                         await self._start_follow_playback(self.follow_stream_info, target_pos, paused=False)
-                        await asyncio.sleep(1.2)
+                        await asyncio.sleep(2.0)
                         continue
 
             except asyncio.CancelledError:
@@ -388,7 +466,7 @@ class MusicCog(commands.Cog):
                 print(f"[FollowMe] Error in follow loop: {e}")
                 await asyncio.sleep(2.0)
 
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(1.0)
 
     @commands.command(aliases=["fm", "sync"])
     async def followme(self, ctx):
@@ -545,4 +623,3 @@ class MusicCog(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(MusicCog(bot))
-
